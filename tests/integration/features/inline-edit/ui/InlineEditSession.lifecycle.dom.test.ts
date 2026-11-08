@@ -644,11 +644,91 @@ it.each([
   { target: 'outside', key: 'Enter', expected: [] },
   { target: 'editor', key: 'Escape', expected: [[{ decision: 'reject' }]] },
   { target: 'editor', key: 'Enter', expected: [[{ decision: 'accept', editedText: 'Hi' }]] },
+  { target: 'composer', key: 'Escape', expected: [[{ decision: 'reject' }]] },
+  { target: 'composer', key: 'Enter', expected: [[{ decision: 'accept', editedText: 'Hi' }]] },
 ] as const)('handles $key in the $target only when it belongs to the edit', async ({ target, key, expected }) => {
   const h = await createHarness();
   h.createSession().show();
   await showReplacementPreview(h);
   const outside = document.body.appendChild(document.createElement('button'));
-  fireEvent.keyDown(target === 'outside' ? outside : h.editorView.contentDOM, { key });
+  const targets = { outside, editor: h.editorView.contentDOM, composer: await screen.findByRole('textbox', { name: 'Edit instructions' }) };
+  fireEvent.keyDown(targets[target], { key });
   expect(h.settled.mock.calls).toEqual(expected);
+  expect(h.backend.sessions[0].requests).toHaveLength(1);
+});
+
+describe('follow-up instructions on a proposed edit', () => {
+  const conversation = () => screen.getByRole('log', { name: 'Inline edit conversation' });
+  const insertedPreview = () => Array.from(
+    document.querySelectorAll('.claudian-inline-diff-preview .claudian-diff-ins'),
+    block => block.textContent,
+  );
+
+  beforeEach(() => {
+    vi.mocked(MarkdownRenderer.render).mockImplementation(async (_app, markdown, element) => {
+      (element as HTMLElement).textContent = markdown;
+    });
+  });
+
+  it('refines the proposal in the same conversation and accepts the latest one', async () => {
+    const h = await createHarness();
+    h.createSession().show();
+    await showReplacementPreview(h, 'Hi');
+    // The composer stays open above the preview, showing what was asked.
+    await waitFor(() => expect(input().placeholder).toBe('Ask for follow-up changes...'));
+    expect(within(conversation()).getByText('Make this clearer')).toBeDefined();
+    expect(await axe(input().closest('.claudian-inline-input-container')!)).toHaveNoViolations();
+
+    submitInstruction('Shorter');
+    await waitFor(() => expect(h.backend.sessions[0].requests).toHaveLength(2));
+    expect(h.backend.sessions).toHaveLength(1);
+    expect(h.backend.sessions[0].requests[1].input).toEqual([{ text: 'Shorter', type: 'text' }]);
+    // The pending proposal stays visible, but Enter does not accept it while its revision runs.
+    expect(insertedPreview()).toEqual(['Hi']);
+    fireEvent.keyDown(document.body, { key: 'Enter' });
+    expect(h.settled).not.toHaveBeenCalled();
+
+    h.backend.sessions[0].emitText('<replacement>Yo</replacement>');
+    h.backend.sessions[0].complete();
+    await waitFor(() => expect(insertedPreview()).toEqual(['Yo']));
+    expect(within(conversation()).getByText('Shorter')).toBeDefined();
+    await waitFor(() => expect(input().disabled).toBe(false));
+    fireEvent.keyDown(input(), { key: 'Enter' });
+    expect(h.settled.mock.calls).toEqual([[{ decision: 'accept', editedText: 'Yo' }]]);
+    expect(h.editorView.state.doc.toString()).toBe('Yo world');
+    expect(h.backend.sessions[0].getStatus()).toBe('disposed');
+  });
+
+  it('answers a question about the proposal without discarding it', async () => {
+    const h = await createHarness();
+    h.createSession().show();
+    await showReplacementPreview(h, 'Hi');
+    submitInstruction('Why this word?');
+    await waitFor(() => expect(h.backend.sessions[0].requests).toHaveLength(2));
+    h.backend.sessions[0].emitText('It is shorter.');
+    h.backend.sessions[0].complete();
+    await within(conversation()).findByText('It is shorter.');
+    expect(insertedPreview()).toEqual(['Hi']);
+    expect(input().placeholder).toBe('Ask for follow-up changes...');
+
+    // Mod+Enter accepts the pending proposal even with an unsent instruction typed.
+    typeInstruction('Never mind');
+    fireEvent.keyDown(input(), { key: 'Enter', ctrlKey: true });
+    expect(h.settled.mock.calls).toEqual([[{ decision: 'accept', editedText: 'Hi' }]]);
+    expect(h.backend.sessions[0].requests).toHaveLength(2);
+    expect(h.editorView.state.doc.toString()).toBe('Hi world');
+  });
+
+  it('keeps the proposal reviewable when a follow-up fails', async () => {
+    const h = await createHarness();
+    h.createSession().show();
+    await showReplacementPreview(h, 'Hi');
+    submitInstruction('Shorter');
+    await waitFor(() => expect(h.backend.sessions[0].requests).toHaveLength(2));
+    h.backend.sessions[0].fail('provider crashed');
+    await waitFor(() => expect(input().disabled).toBe(false));
+    expect(insertedPreview()).toEqual(['Hi']);
+    fireEvent.click(screen.getByRole('button', { name: 'Accept inline edit' }));
+    expect(h.settled.mock.calls).toEqual([[{ decision: 'accept', editedText: 'Hi' }]]);
+  });
 });

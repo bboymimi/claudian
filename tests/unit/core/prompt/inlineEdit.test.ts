@@ -79,6 +79,7 @@ describe('getInlineEditSystemPrompt', () => {
     expect(prompt).toContain('<insertion>inserted text</insertion>');
     expect(prompt).toContain('respond with plain text');
     expect(prompt).toContain('ask one concise, specific question');
+    expect(prompt).toContain('return the complete revised result for that original selection or cursor position');
     expect(prompt).toContain('Inspect additional content only when needed');
     expect(prompt).not.toContain('## Thinking Process');
     expect(prompt).not.toContain('ABSOLUTE RULE');

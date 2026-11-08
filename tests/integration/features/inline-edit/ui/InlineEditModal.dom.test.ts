@@ -350,7 +350,7 @@ it('keeps open inline suggestions anchored after note scroll and viewport resize
   expect(measure).not.toHaveBeenCalled();
 });
 
-it('shows only the newest clarification when an older render finishes last', async () => {
+it('keeps every exchange in order when an older reply finishes rendering last', async () => {
   const h = await createHarness();
   const renders: Array<() => void> = [];
   vi.mocked(MarkdownRenderer.render).mockImplementation((_app, markdown, element) => {
@@ -372,13 +372,13 @@ it('shows only the newest clarification when an older render finishes last', asy
     h.app, 'Second question?', expect.any(HTMLElement), h.notePath, expect.any(Component),
   );
 
-  const container = input().closest('.claudian-inline-input-container') as HTMLElement;
+  const conversation = screen.getByRole('log', { name: 'Inline edit conversation' });
   renders[1]();
-  await within(container).findByText('Second question?');
+  await within(conversation).findByText('Second question?');
   renders[0]();
   await new Promise(resolve => window.setTimeout(resolve, 0));
-  expect(within(container).getByText('Second question?')).toBeDefined();
-  expect(within(container).queryByText('First question?')).toBeNull();
+  expect(Array.from(conversation.children, turn => turn.textContent))
+    .toEqual(['Improve', 'First question?', 'Formal', 'Second question?']);
 });
 
 it('previews the selected source as deleted and the replacement as inserted Markdown', async () => {
@@ -393,11 +393,12 @@ it('previews the selected source as deleted and the replacement as inserted Mark
     block.classList.contains('claudian-diff-del') ? 'delete' : block.classList.contains('claudian-diff-ins') ? 'insert' : 'equal',
     block.textContent,
   ])).toEqual([['delete', 'hello'], ['insert', 'Hi']]));
-  // The previewed source is hidden from the editor until the edit settles.
-  expect(h.editorView.contentDOM.textContent).toBe(`${preview.textContent} world`);
+  // The previewed source is hidden from the editor until the edit settles; the composer stays above it.
+  const composer = input().closest('.claudian-inline-input-container')!;
+  expect(h.editorView.contentDOM.textContent).toBe(`${composer.textContent}${preview.textContent} world`);
 });
 
-it('releases Markdown resources when clarification previews are replaced and the edit closes', async () => {
+it('releases Markdown resources of every reply when the edit closes', async () => {
   const h = await createHarness();
   const released: string[] = [];
   vi.mocked(MarkdownRenderer.render).mockImplementation(async (_app, markdown, element, _path, component) => {
@@ -417,7 +418,8 @@ it('releases Markdown resources when clarification previews are replaced and the
   h.backend.sessions[0].emitText('Second question?');
   h.backend.sessions[0].complete();
   await screen.findByText('Second question?');
-  expect(released).toEqual(['First question?']);
+  // Earlier replies stay in the conversation.
+  expect(released).toEqual([]);
   session.close();
   expect(released).toEqual(['First question?', 'Second question?']);
   expect(screen.queryByRole('textbox', { name: 'Edit instructions' })).toBeNull();

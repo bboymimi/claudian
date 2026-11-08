@@ -78,7 +78,30 @@ describe('InlineEditService', () => {
     expect(backend.sessions[0].requests[1].input[0]).not.toMatchObject({
       text: expect.stringContaining('<editor_selection'),
     });
+    // A proposed edit stays open for follow-up instructions until the caller ends it.
+    expect(service.isConversing).toBe(true);
+  });
+
+  it('continues a proposed edit with follow-up instructions in the same session', async () => {
+    const { backend, service } = createService();
+    const first = service.send({ ...selection, instruction: 'Improve' });
+    await waitFor(() => backend.sessions[0]?.requests.length === 1);
+    backend.sessions[0].emitText('<replacement>Better draft</replacement>');
+    backend.sessions[0].complete();
+    await expect(first).resolves.toEqual({ editedText: 'Better draft', success: true });
+    expect(service.isConversing).toBe(true);
+
+    const followUp = service.send({ ...selection, instruction: 'Shorter' });
+    await waitFor(() => backend.sessions[0]?.requests.length === 2);
+    expect(backend.sessions).toHaveLength(1);
+    expect(backend.sessions[0].requests[1].input).toEqual([{ text: 'Shorter', type: 'text' }]);
+    backend.sessions[0].emitText('<replacement>Draft</replacement>');
+    backend.sessions[0].complete();
+    await expect(followUp).resolves.toEqual({ editedText: 'Draft', success: true });
+
+    service.end();
     expect(service.isConversing).toBe(false);
+    expect(backend.sessions[0].getStatus()).toBe('disposed');
   });
 
   it('reports a transition that invalidated continuity and then starts from the editor context', async () => {

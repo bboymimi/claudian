@@ -98,24 +98,51 @@ body.claudian-selection-highlight-active ::highlight(claudian-selection) {
   padding: 0;
 }
 
-/* Clarifying question: the card's first section, above the reply row. */
-.claudian-inline-agent-reply {
+/*
+ * Conversation: the card's first section, above the instruction row. A long one scrolls inside the
+ * card, kept at its newest turn.
+ */
+.claudian-inline-thread {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: min(40vh, 320px);
+  overflow-y: auto;
   padding: 10px 12px;
   border-bottom: 1px solid var(--background-modifier-border);
   font-size: var(--font-ui-small, 13px);
   line-height: 1.45;
   color: var(--text-normal);
-  overflow-x: auto;
   overflow-wrap: break-word;
 }
 
-.claudian-inline-agent-reply > :first-child,
+/* The user's own instructions read as sent messages, set apart from the agent's replies. */
+.claudian-inline-turn-instruction {
+  align-self: flex-end;
+  max-width: 85%;
+  padding: 3px 8px;
+  border-radius: 6px;
+  background: var(--background-modifier-hover);
+  color: var(--text-muted);
+  white-space: pre-wrap;
+}
+
+.claudian-inline-turn-reply {
+  overflow-x: auto;
+}
+
+.claudian-inline-turn-proposal {
+  color: var(--text-faint);
+  font-size: var(--font-ui-smaller, 12px);
+}
+
+.claudian-inline-turn-reply > :first-child,
 .claudian-inline-diff-preview-body > :first-child,
 .claudian-diff-block > :first-child {
   margin-top: 0;
 }
 
-.claudian-inline-agent-reply > :last-child,
+.claudian-inline-turn-reply > :last-child,
 .claudian-inline-diff-preview-body > :last-child,
 .claudian-diff-block > :last-child {
   margin-bottom: 0;

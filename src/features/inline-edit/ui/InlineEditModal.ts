@@ -54,14 +54,9 @@ const showInlineEdit = StateEffect.define<{
   widget: InlineEditSession;
   isInbetween?: boolean;
 }>();
-const showDiff = StateEffect.define<{
-  from: number;
-  to: number;
-  diffOps: DiffOp[];
-  previewPos: number;
-  widget: InlineEditSession;
-}>();
-const showInsertion = StateEffect.define<{
+const showReview = StateEffect.define<{
+  /** The source the preview stands in for, or null when the source stays visible. */
+  hidden: { from: number; to: number } | null;
   diffOps: DiffOp[];
   previewPos: number;
   widget: InlineEditSession;
@@ -139,22 +134,17 @@ const inlineEditField = StateField.define<DecorationSet>({
           isInbetween: e.value.isInbetween,
           widget: new InputWidget(e.value.widget),
         });
-      } else if (e.is(showDiff)) {
+      } else if (e.is(showReview)) {
+        // The composer stays above the preview (the lower side sorts first) for follow-up instructions.
+        const { diffOps, hidden, previewPos, widget } = e.value;
         deco = Decoration.set([
+          Decoration.widget({ widget: new InputWidget(widget), block: true, side: -2 }).range(previewPos),
           Decoration.widget({
-            widget: new MarkdownDiffWidget(e.value.diffOps, e.value.widget),
+            widget: new MarkdownDiffWidget(diffOps, widget),
             block: true,
             side: -1,
-          }).range(e.value.previewPos),
-          Decoration.replace({}).range(e.value.from, e.value.to),
-        ], true);
-      } else if (e.is(showInsertion)) {
-        deco = Decoration.set([
-          Decoration.widget({
-            widget: new MarkdownDiffWidget(e.value.diffOps, e.value.widget),
-            block: true,
-            side: -1,
-          }).range(e.value.previewPos),
+          }).range(previewPos),
+          ...(hidden ? [Decoration.replace({}).range(hidden.from, hidden.to)] : []),
         ], true);
       } else if (e.is(hideInlineEdit)) {
         deco = Decoration.none;
@@ -177,6 +167,27 @@ function getDiffBlockClass(type: DiffOp['type']): string {
 }
 
 export type InlineEditDecision = 'accept' | 'edit' | 'reject';
+
+const FOLLOW_UP_PLACEHOLDER = 'Ask for follow-up changes...';
+
+/** The edit under review; accepting writes its text over the source range. */
+interface InlineEditProposal {
+  /** A replacement previews in place of its source; an insertion previews above it. */
+  kind: 'replacement' | 'insertion';
+  text: string;
+  diffOps: DiffOp[];
+}
+
+/** One entry of the composer's conversation; a proposed edit is listed by its line counts. */
+type InlineEditTurn =
+  | { kind: 'instruction'; text: string }
+  | { kind: 'reply'; markdown: string }
+  | { kind: 'proposal'; added: number; removed: number };
+
+function describeProposal({ added, removed }: { added: number; removed: number }): string {
+  const counts = [removed > 0 ? `−${removed}` : '', added > 0 ? `+${added}` : ''].filter(Boolean).join(' ');
+  return `Proposed edit (${counts || 'no changes'})`;
+}
 
 interface InlineEditProviderContext {
   modelOverride?: string;
@@ -323,10 +334,12 @@ export class InlineEditSession {
   private inputEl: HTMLInputElement | null = null;
   private spinnerEl: HTMLElement | null = null;
   private modelToolbarEl: HTMLElement | null = null;
-  private agentReplyEl: HTMLElement | null = null;
-  private containerEl: HTMLElement | null = null;
-  private editedText: string | null = null;
-  private insertedText: string | null = null;
+  private threadEl: HTMLElement | null = null;
+  private composerEl: HTMLElement | null = null;
+  private previewEl: HTMLElement | null = null;
+  #proposal: InlineEditProposal | null = null;
+  /** The conversation so far; the composer lists it each time CodeMirror rebuilds it. */
+  readonly #turns: InlineEditTurn[] = [];
   private selFrom = 0;
   private selTo = 0;
   private selectedText: string;
@@ -335,13 +348,14 @@ export class InlineEditSession {
   private cursorContext: CursorContext | null = null;
   /** The service requests run on, and the provider it was started for. */
   #inlineEdit: { providerId: ProviderId; service: InlineEditService };
-  /** Removes the current phase's Escape/Enter listener. */
+  /** Removes the session's Escape listener. */
   private releaseKeyHandler: (() => void) | null = null;
+  /** Removes the Escape/Enter listener that settles a proposal from outside the composer. */
+  private releaseReviewKeyHandler: (() => void) | null = null;
   private selectionListener: ((e: Event) => void) | null = null;
   private generating = false;
   private instructionDraft = '';
   private inputPlaceholder: string | null = null;
-  private replyMarkdown: string | null = null;
   /** The provider the model chip shows; requests wait until its service runs. */
   private pickedProviderId: ProviderId;
   private inputResources: {
@@ -357,7 +371,6 @@ export class InlineEditSession {
   private reasoningOverride: string | undefined;
   private mentionDataProvider: VaultMentionDataProvider;
   private releaseMentionCacheEvents: (() => void) | null = null;
-  private agentReplyRenderVersion = 0;
   private readonly previewScopes = new Map<HTMLElement, MarkdownRenderScope>();
   /** The document the edit was computed against; CodeMirror documents are immutable. */
   private sourceDoc: Text | null = null;
@@ -505,12 +518,11 @@ export class InlineEditSession {
     this.instructionDraft = this.inputEl?.value ?? this.instructionDraft;
     this.inputResources.dispose();
     this.inputResources = null;
-    this.agentReplyRenderVersion += 1;
     this.inputEl = null;
     this.spinnerEl = null;
     this.modelToolbarEl = null;
-    this.agentReplyEl = null;
-    if (this.containerEl === container) this.containerEl = null;
+    this.threadEl = null;
+    if (this.composerEl === container) this.composerEl = null;
   }
 
   createInputDOM(): HTMLElement {
@@ -520,11 +532,14 @@ export class InlineEditSession {
       cls: 'claudian-inline-input-container',
       attr: { 'data-provider': this.#inlineEdit.providerId },
     });
-    this.containerEl = container;
+    this.composerEl = container;
 
     // The widget root only spaces the card: Obsidian zeroes editor widget margins.
     const cardEl = container.createDiv({ cls: 'claudian-inline-composer' });
-    this.agentReplyEl = cardEl.createDiv({ cls: 'claudian-inline-agent-reply claudian-hidden' });
+    this.threadEl = cardEl.createDiv({
+      cls: 'claudian-inline-thread claudian-hidden',
+      attr: { role: 'log', 'aria-label': 'Inline edit conversation' },
+    });
 
     const inputWrap = cardEl.createDiv({ cls: 'claudian-inline-input-wrap' });
 
@@ -610,7 +625,7 @@ export class InlineEditSession {
         discovery?.invalidate();
       },
     };
-    if (this.replyMarkdown !== null) this.showAgentReply(this.replyMarkdown);
+    for (const turn of this.#turns) this.#appendTurnDOM(turn);
     return container;
   }
 
@@ -712,7 +727,7 @@ export class InlineEditSession {
     if (providerId !== this.#inlineEdit.providerId) {
       this.#inlineEdit.service.end();
       this.#inlineEdit = { providerId, service: ProviderRegistry.createInlineEditService(this.host.providerHost, providerId) };
-      this.#updateHighlight();
+      this.#render();
     }
     return true;
   }
@@ -772,7 +787,7 @@ export class InlineEditSession {
 
   destroyDiffPreviewDOM(container: HTMLElement): void {
     this.releasePreviews(container);
-    if (this.containerEl === container) this.containerEl = null;
+    if (this.previewEl === container) this.previewEl = null;
   }
 
   private releasePreviews(container?: HTMLElement): void {
@@ -785,7 +800,7 @@ export class InlineEditSession {
 
   createDiffPreviewDOM(diffOps: DiffOp[]): HTMLElement {
     const previewEl = createDiv({ cls: 'claudian-inline-diff-preview' });
-    this.containerEl = previewEl;
+    this.previewEl = previewEl;
 
     const bodyEl = previewEl.createDiv({ cls: 'claudian-inline-diff-preview-body markdown-rendered' });
 
@@ -852,7 +867,7 @@ export class InlineEditSession {
   async #renderMarkdownDiffPreview(container: HTMLElement, diffOps: DiffOp[]): Promise<void> {
     container.empty();
     for (const document of buildMarkdownDiffDocuments(diffOps)) {
-      if (this.settled || !this.containerEl?.contains(container)) return;
+      if (this.settled || !this.previewEl?.contains(container)) return;
       if (!document.markdown) continue;
 
       const opEl = container.createDiv({ cls: `claudian-diff-block ${getDiffBlockClass(document.type)}` });
@@ -914,21 +929,16 @@ export class InlineEditSession {
 
     if (result.success) {
       if (result.editedText !== undefined) {
-        this.editedText = result.editedText;
-        this.#showDiffInPlace();
+        this.#showProposal(userMessage, {
+          kind: 'replacement',
+          text: result.editedText,
+          diffOps: computeMarkdownDiff(this.selectedText, result.editedText),
+        });
       } else if (result.insertedText !== undefined) {
-        this.insertedText = result.insertedText;
-        this.#showInsertionInPlace();
+        const text = normalizeInsertionText(result.insertedText);
+        this.#showProposal(userMessage, { kind: 'insertion', text, diffOps: [{ type: 'insert', text }] });
       } else if (result.clarification) {
-        this.instructionDraft = '';
-        this.inputPlaceholder = 'Reply to continue...';
-        this.showAgentReply(result.clarification);
-        if (this.inputEl) {
-          this.inputEl.disabled = false;
-          this.inputEl.value = '';
-          this.inputEl.placeholder = this.inputPlaceholder;
-          this.inputEl.focus();
-        }
+        this.#showReply(userMessage, result.clarification);
       } else {
         this.#handleError('No response from agent');
       }
@@ -959,23 +969,76 @@ export class InlineEditSession {
     };
   }
 
-  private showAgentReply(message: string) {
-    this.replyMarkdown = message;
-    if (!this.agentReplyEl || !this.containerEl) return;
-    const replyEl = this.agentReplyEl;
-    const renderVersion = ++this.agentReplyRenderVersion;
-    this.releasePreviews(replyEl);
-    const renderedEl = this.agentReplyEl.createDiv();
+  /** A text reply joins the conversation; a proposal under review stays as it is. */
+  #showReply(instruction: string, markdown: string): void {
+    this.#clearInstruction(this.#proposal ? FOLLOW_UP_PLACEHOLDER : 'Reply to continue...');
+    this.#addTurn({ kind: 'instruction', text: instruction });
+    this.#addTurn({ kind: 'reply', markdown });
+    this.inputEl?.focus();
+  }
 
-    replyEl.removeClass('claudian-hidden');
-    replyEl.empty();
-    void this.#renderMarkdownPreview(renderedEl, message, replyEl).then(() => {
-      if (renderVersion !== this.agentReplyRenderVersion || replyEl !== this.agentReplyEl) {
-        return;
-      }
-      replyEl.replaceChildren(...Array.from(renderedEl.childNodes));
+  /** A new proposal replaces the one under review; the composer stays open above it for follow-ups. */
+  #showProposal(instruction: string, proposal: InlineEditProposal): void {
+    this.#proposal = proposal;
+    this.#clearInstruction(FOLLOW_UP_PLACEHOLDER);
+    // The composer rebuilds below with the whole conversation, so these need no DOM of their own.
+    this.#turns.push({ kind: 'instruction', text: instruction }, {
+      kind: 'proposal',
+      added: countDiffLines(proposal.diffOps, 'insert'),
+      removed: countDiffLines(proposal.diffOps, 'delete'),
     });
-    this.containerEl.classList.add('has-agent-reply');
+    this.#render();
+    this.#installReviewKeyHandler();
+  }
+
+  #clearInstruction(placeholder: string): void {
+    this.instructionDraft = '';
+    this.inputPlaceholder = placeholder;
+    if (!this.inputEl) return;
+    this.inputEl.disabled = false;
+    this.inputEl.value = '';
+    this.inputEl.placeholder = placeholder;
+  }
+
+  #addTurn(turn: InlineEditTurn): void {
+    this.#turns.push(turn);
+    this.#appendTurnDOM(turn);
+  }
+
+  #appendTurnDOM(turn: InlineEditTurn): void {
+    const threadEl = this.threadEl;
+    if (!threadEl) return;
+    threadEl.removeClass('claudian-hidden');
+    if (turn.kind === 'reply') {
+      const replyEl = threadEl.createDiv({ cls: 'claudian-inline-turn claudian-inline-turn-reply' });
+      void this.#renderMarkdownPreview(replyEl, turn.markdown).then(() => {
+        threadEl.scrollTop = threadEl.scrollHeight;
+      });
+    } else {
+      threadEl.createDiv({
+        cls: `claudian-inline-turn claudian-inline-turn-${turn.kind}`,
+        text: turn.kind === 'instruction' ? turn.text : describeProposal(turn),
+      });
+    }
+    threadEl.scrollTop = threadEl.scrollHeight;
+  }
+
+  /** Shows the composer alone while instructions are drafted, or above the proposal under review. */
+  #render(): void {
+    const proposal = this.#proposal;
+    if (!proposal) {
+      this.#updateHighlight();
+      return;
+    }
+    hideSelectionHighlight(this.editorView);
+    this.editorView.dispatch({
+      effects: showReview.of({
+        hidden: proposal.kind === 'replacement' ? { from: this.selFrom, to: this.selTo } : null,
+        diffOps: proposal.diffOps,
+        previewPos: this.editorView.state.doc.lineAt(this.selFrom).from,
+        widget: this,
+      }),
+    });
   }
 
   #handleError(errorMessage: string) {
@@ -983,7 +1046,8 @@ export class InlineEditSession {
     if (!this.inputEl) return;
     this.inputEl.disabled = false;
     this.inputEl.placeholder = errorMessage;
-    if (!this.#inlineEdit.service.isConversing) {
+    // Until a proposal or conversation pins the source, the edit follows the selection again.
+    if (!this.#proposal && !this.#inlineEdit.service.isConversing) {
       this.#updatePositionsFromEditor();
       this.#updateHighlight();
       this.#attachSelectionListeners();
@@ -991,78 +1055,39 @@ export class InlineEditSession {
     this.inputEl.focus();
   }
 
-  #showDiffInPlace() {
-    if (this.editedText === null) return;
-
-    hideSelectionHighlight(this.editorView);
-
-    const diffOps = computeMarkdownDiff(this.selectedText, this.editedText);
-    const previewPos = this.editorView.state.doc.lineAt(this.selFrom).from;
-
-    this.editorView.dispatch({
-      effects: showDiff.of({
-        from: this.selFrom,
-        to: this.selTo,
-        diffOps,
-        previewPos,
-        widget: this,
-      }),
-    });
-
-    this.#installAcceptRejectHandler();
-  }
-
-  #showInsertionInPlace() {
-    if (this.insertedText === null) return;
-
-    hideSelectionHighlight(this.editorView);
-
-    const trimmedText = normalizeInsertionText(this.insertedText);
-    this.insertedText = trimmedText;
-
-    const diffOps: DiffOp[] = [{ type: 'insert', text: trimmedText }];
-    const previewPos = this.editorView.state.doc.lineAt(this.selFrom).from;
-
-    this.editorView.dispatch({
-      effects: showInsertion.of({
-        diffOps,
-        previewPos,
-        widget: this,
-      }),
-    });
-
-    this.#installAcceptRejectHandler();
-  }
-
   /**
    * Window capture runs ahead of CodeMirror, which would insert a newline on Enter and so turn the
-   * accept into a stale-source rejection, and ahead of Obsidian's keymap, which handles Escape.
+   * accept into a stale-source rejection, and ahead of Obsidian's keymap, which handles Escape. Keys in
+   * the composer are its own: Enter there sends a follow-up or accepts, and Escape rejects on bubbling.
    */
-  #installAcceptRejectHandler() {
-    this.releaseKeyHandler?.();
+  #installReviewKeyHandler() {
+    if (this.releaseReviewKeyHandler) return;
     const keyTarget = this.getOwnerDocument().defaultView ?? window;
     const onKeydown = (e: KeyboardEvent) => {
       if (e.isComposing || !this.isKeyboardEventInContext(e)) return;
+      const target = e.target as Node;
+      if (this.composerEl?.contains(target)) return;
       if (e.key === 'Escape') {
         e.preventDefault();
         e.stopPropagation();
         this.reject();
-      } else if (e.key === 'Enter' && !this.containerEl?.contains(e.target as Node)) {
-        // Preview controls keep their native Enter activation.
+      } else if (e.key === 'Enter' && !this.previewEl?.contains(target)) {
+        // Preview controls keep their native Enter activation. While a follow-up runs, a stray Enter
+        // neither accepts the proposal it may replace nor edits the source.
         e.preventDefault();
         e.stopPropagation();
-        this.accept();
+        if (!this.generating) this.accept();
       }
     };
     keyTarget.addEventListener('keydown', onKeydown, true);
-    this.releaseKeyHandler = () => keyTarget.removeEventListener('keydown', onKeydown, true);
+    this.releaseReviewKeyHandler = () => keyTarget.removeEventListener('keydown', onKeydown, true);
   }
 
   accept() {
     if (this.settled) {
       return;
     }
-    const textToInsert = this.editedText ?? this.insertedText;
+    const textToInsert = this.#proposal?.text ?? null;
     if (textToInsert !== null) {
       if (!this.#isSourceUnchanged()) {
         this.#rejectStaleSource();
@@ -1125,6 +1150,8 @@ export class InlineEditSession {
     this.#removeSelectionListeners();
     this.releaseKeyHandler?.();
     this.releaseKeyHandler = null;
+    this.releaseReviewKeyHandler?.();
+    this.releaseReviewKeyHandler = null;
     if (this.inputResources) this.destroyInputDOM(this.inputResources.container);
 
     if (this.editorDestroyed) return;
@@ -1165,9 +1192,8 @@ export class InlineEditSession {
       return false;
     }
     return target === this.getOwnerDocument().body
-      || target === this.containerEl
-      || this.containerEl?.contains(target) === true
-      || target === this.editorView.dom
+      || this.composerEl?.contains(target) === true
+      || this.previewEl?.contains(target) === true
       || this.editorView.dom.contains(target);
   }
 
@@ -1180,9 +1206,13 @@ export class InlineEditSession {
       return;
     }
 
-    if (e.key === 'Enter' && !e.isComposing) {
-      e.preventDefault();
-      void this.generate();
+    if (e.key !== 'Enter' || e.isComposing) return;
+    e.preventDefault();
+    // Under review, Mod+Enter or Enter on an empty composer accepts; anything typed is a follow-up.
+    if (this.#proposal && (e.ctrlKey || e.metaKey || !this.inputEl?.value.trim())) {
+      this.accept();
+      return;
     }
+    void this.generate();
   }
 }
